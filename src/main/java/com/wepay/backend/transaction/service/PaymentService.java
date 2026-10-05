@@ -5,6 +5,10 @@ import com.wepay.backend.bank.repository.BankAccountRepository;
 import com.wepay.backend.notification.enums.NotificationType;
 import com.wepay.backend.notification.service.NotificationService;
 import com.wepay.backend.pin.service.PaymentPinService;
+import com.wepay.backend.risk.dto.RiskAssessment;
+import com.wepay.backend.risk.enums.RiskLevel;
+import com.wepay.backend.risk.service.RiskAuditService;
+import com.wepay.backend.risk.service.RiskEngineService;
 import com.wepay.backend.transaction.dto.PaymentRequest;
 import com.wepay.backend.transaction.entity.Transaction;
 import com.wepay.backend.transaction.enums.TransactionStatus;
@@ -29,6 +33,9 @@ public class PaymentService {
     private final NotificationService notificationService;
     private final WalletService walletService;
 
+    private final RiskEngineService riskEngineService;
+    private final RiskAuditService riskAuditService;
+
     public PaymentService(
             TransactionRepository transactionRepository,
             UserRepository userRepository,
@@ -36,7 +43,9 @@ public class PaymentService {
             PaymentProvider paymentProvider,
             PaymentPinService paymentPinService,
             NotificationService notificationService,
-            WalletService walletService
+            WalletService walletService,
+            RiskEngineService riskEngineService,
+            RiskAuditService riskAuditService
     ) {
         this.transactionRepository = transactionRepository;
         this.userRepository = userRepository;
@@ -45,6 +54,9 @@ public class PaymentService {
         this.paymentPinService = paymentPinService;
         this.notificationService = notificationService;
         this.walletService = walletService;
+
+        this.riskEngineService = riskEngineService;
+        this.riskAuditService = riskAuditService;
     }
 
     @Transactional
@@ -53,6 +65,13 @@ public class PaymentService {
             PaymentRequest request
     ) {
 
+        /*
+         * =========================================================
+         * 1. IDEMPOTENCY CHECK
+         * =========================================================
+         *
+         * Prevent the same payment from being processed twice.
+         */
         Optional<Transaction> existingTransaction =
                 transactionRepository.findByIdempotencyKey(
                         request.getIdempotencyKey()
@@ -62,6 +81,11 @@ public class PaymentService {
             return existingTransaction.get();
         }
 
+        /*
+         * =========================================================
+         * 2. SELF PAYMENT CHECK
+         * =========================================================
+         */
         if (senderUserId.equals(
                 request.getReceiverUserId()
         )) {
@@ -71,6 +95,11 @@ public class PaymentService {
             );
         }
 
+        /*
+         * =========================================================
+         * 3. RECEIVER VALIDATION
+         * =========================================================
+         */
         if (!userRepository.existsById(
                 request.getReceiverUserId()
         )) {
@@ -80,6 +109,87 @@ public class PaymentService {
             );
         }
 
+        /*
+         * =========================================================
+         * 4. FRAUD / RISK ASSESSMENT
+         * =========================================================
+         */
+        RiskAssessment riskAssessment =
+                riskEngineService.assess(
+                        senderUserId,
+                        request.getReceiverUserId(),
+                        request.getAmount()
+                );
+
+        /*
+         * =========================================================
+         * 5. HIGH RISK
+         * =========================================================
+         *
+         * HIGH risk transactions are blocked.
+         */
+        if (riskAssessment.getRiskLevel()
+                == RiskLevel.HIGH) {
+
+            riskAuditService.recordAssessment(
+                    senderUserId,
+                    request.getReceiverUserId(),
+                    request.getAmount(),
+                    riskAssessment,
+                    "BLOCKED"
+            );
+
+            notificationService.createNotification(
+                    senderUserId,
+                    NotificationType.PAYMENT_FAILED,
+                    "Payment blocked by fraud risk engine. "
+                            + riskAssessment.getReason()
+            );
+
+            throw new RuntimeException(
+                    "Transaction blocked by fraud risk engine. "
+                            + riskAssessment.getReason()
+            );
+        }
+
+        /*
+         * =========================================================
+         * 6. MEDIUM RISK
+         * =========================================================
+         *
+         * Medium-risk payments are currently allowed,
+         * but we record them as FLAGGED.
+         */
+        if (riskAssessment.getRiskLevel()
+                == RiskLevel.MEDIUM) {
+
+            riskAuditService.recordAssessment(
+                    senderUserId,
+                    request.getReceiverUserId(),
+                    request.getAmount(),
+                    riskAssessment,
+                    "FLAGGED"
+            );
+
+        } else {
+
+            /*
+             * LOW risk transaction.
+             */
+            riskAuditService.recordAssessment(
+                    senderUserId,
+                    request.getReceiverUserId(),
+                    request.getAmount(),
+                    riskAssessment,
+                    "ALLOWED"
+            );
+        }
+
+        /*
+         * =========================================================
+         * 7. BANK ACCOUNT VALIDATION
+         * =========================================================
+         */
         BankAccount bankAccount =
                 bankAccountRepository
                         .findByIdAndUserId(
@@ -92,6 +202,9 @@ public class PaymentService {
                                 )
                         );
 
+        /*
+         * Bank account must be verified.
+         */
         if (!bankAccount.isVerified()) {
 
             throw new RuntimeException(
@@ -99,6 +212,11 @@ public class PaymentService {
             );
         }
 
+        /*
+         * =========================================================
+         * 8. PAYMENT PIN VALIDATION
+         * =========================================================
+         */
         boolean pinValid =
                 paymentPinService.verifyPin(
                         senderUserId,
@@ -112,6 +230,11 @@ public class PaymentService {
             );
         }
 
+        /*
+         * =========================================================
+         * 9. PAYMENT PROVIDER
+         * =========================================================
+         */
         TransactionStatus status =
                 paymentProvider.processPayment(
                         senderUserId,
@@ -120,8 +243,9 @@ public class PaymentService {
                 );
 
         /*
-         * Create and save the payment transaction first.
-         * This gives us the transaction ID.
+         * =========================================================
+         * 10. CREATE TRANSACTION
+         * =========================================================
          */
         Transaction transaction =
                 new Transaction(
@@ -136,21 +260,33 @@ public class PaymentService {
                 transactionRepository.save(transaction);
 
         /*
-         * Only successful payments affect wallets.
+         * =========================================================
+         * 11. SUCCESSFUL PAYMENT
+         * =========================================================
          */
         if (status == TransactionStatus.SUCCESS) {
 
+            /*
+             * Debit sender wallet.
+             */
             walletService.debit(
                     senderUserId,
                     request.getAmount(),
                     savedTransaction.getTransactionReference()
             );
 
+            /*
+             * Credit receiver wallet.
+             */
             walletService.credit(
                     request.getReceiverUserId(),
                     request.getAmount(),
                     savedTransaction.getTransactionReference()
             );
+
+            /*
+             * Sender notification.
+             */
             notificationService.createNotification(
                     senderUserId,
                     NotificationType.PAYMENT_SUCCESS,
@@ -159,6 +295,9 @@ public class PaymentService {
                             + " sent successfully."
             );
 
+            /*
+             * Receiver notification.
+             */
             notificationService.createNotification(
                     request.getReceiverUserId(),
                     NotificationType.PAYMENT_SUCCESS,
@@ -169,6 +308,11 @@ public class PaymentService {
 
         } else if (status == TransactionStatus.FAILED) {
 
+            /*
+             * =====================================================
+             * FAILED PAYMENT
+             * =====================================================
+             */
             notificationService.createNotification(
                     senderUserId,
                     NotificationType.PAYMENT_FAILED,
@@ -178,6 +322,9 @@ public class PaymentService {
             );
         }
 
+        /*
+         * Return saved transaction.
+         */
         return savedTransaction;
     }
 }
