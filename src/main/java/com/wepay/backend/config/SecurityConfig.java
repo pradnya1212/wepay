@@ -1,16 +1,12 @@
 package com.wepay.backend.config;
 
 import com.wepay.backend.security.JwtAuthenticationFilter;
-
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
-
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
-
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
@@ -20,32 +16,23 @@ public class SecurityConfig {
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
 
     public SecurityConfig(
-            JwtAuthenticationFilter jwtAuthenticationFilter) {
-
+            JwtAuthenticationFilter jwtAuthenticationFilter
+    ) {
         this.jwtAuthenticationFilter = jwtAuthenticationFilter;
     }
 
     @Bean
     public PasswordEncoder passwordEncoder() {
-
         return new BCryptPasswordEncoder();
     }
 
     @Bean
     public SecurityFilterChain securityFilterChain(
-            HttpSecurity http) throws Exception {
+            HttpSecurity http
+    ) throws Exception {
 
         http
-
-                // =========================
-                // CSRF
-                // =========================
-
                 .csrf(csrf -> csrf.disable())
-
-                // =========================
-                // SESSION MANAGEMENT
-                // =========================
 
                 .sessionManagement(session ->
                         session.sessionCreationPolicy(
@@ -53,33 +40,38 @@ public class SecurityConfig {
                         )
                 )
 
-                // =========================
-                // AUTHORIZATION
-                // =========================
-
                 .authorizeHttpRequests(auth -> auth
 
-                        // Register & Login
+                        // Authentication APIs
                         .requestMatchers("/api/auth/**")
                         .permitAll()
 
-                        // Current logged-in user
+                        // User profile
                         .requestMatchers("/api/users/me")
                         .authenticated()
 
-                        // User management
-                        // Only ADMIN
+                        // Admin user APIs
                         .requestMatchers("/api/users/**")
                         .hasRole("ADMIN")
 
-                        // Everything else
+                        // Risk history - user specific
+                        .requestMatchers(
+                                "/api/risk/my-history",
+                                "/api/risk/received-history"
+                        )
+                        .authenticated()
+
+                        // Risk monitoring - ADMIN only
+                        .requestMatchers(
+                                "/api/risk/recent",
+                                "/api/risk/high-risk"
+                        )
+                        .hasRole("ADMIN")
+
+                        // Everything else requires authentication
                         .anyRequest()
                         .authenticated()
                 )
-
-                // =========================
-                // JWT FILTER
-                // =========================
 
                 .addFilterBefore(
                         jwtAuthenticationFilter,
